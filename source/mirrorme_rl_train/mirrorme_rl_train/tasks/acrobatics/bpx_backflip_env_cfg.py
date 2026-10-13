@@ -11,7 +11,7 @@ Training interface
   - Previous raw action (12D)
 * Action: 12 joint-position residuals.
 * Critic: actor observations plus privileged base linear velocity (48 dimensions).
-* Curriculum: Progressive gravity ramp from Mars (-4.90 m/s^2) to Earth (-9.81 m/s^2).
+* Curriculum: Progressive difficulty ramp scaling launch thrust, apex height, and pitch rate.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
 
 # -----------------------------------------------------------------------------
-# Backflip Phase Clock, Rewards, & Curriculum
+# Backflip Phase Clock, Rewards, & Progressive Curriculum
 # -----------------------------------------------------------------------------
 
 def flip_phase_clock(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -64,13 +64,20 @@ def takeoff_thrust(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_vz: float = 2.0,
     max_phase: float = 0.35,
+    ramp_iterations: int = 3000,
 ) -> torch.Tensor:
-    """Reward positive vertical launch velocity during the takeoff window."""
+    """Reward positive vertical launch velocity, progressively increasing target vz."""
     asset = env.scene[asset_cfg.name]
     vz = asset.data.root_lin_vel_w[:, 2]
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_takeoff = (phase < max_phase).float()
-    return torch.clamp(vz / target_vz, min=0.0, max=1.5) * in_takeoff
+
+    # Curriculum: start at 1.0 m/s (easy hop), ramp to target_vz (2.0 m/s full explosive launch)
+    current_iter = env.common_step_counter // 24
+    progress = min(1.0, current_iter / float(ramp_iterations))
+    effective_target_vz = 1.0 + progress * (target_vz - 1.0)
+
+    return torch.clamp(vz / effective_target_vz, min=0.0, max=1.5) * in_takeoff
 
 
 def backflip_pitch_rate(
@@ -78,13 +85,20 @@ def backflip_pitch_rate(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_pitch_rate: float = -7.0,
     max_phase: float = 0.75,
+    ramp_iterations: int = 3000,
 ) -> torch.Tensor:
-    """Reward backward pitch rotation rate around the body Y-axis."""
+    """Reward backward pitch rotation rate, progressively demanding faster rotation."""
     asset = env.scene[asset_cfg.name]
     pitch_rate = asset.data.root_ang_vel_b[:, 1]
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_spin = (phase < max_phase).float()
-    return torch.clamp(-pitch_rate / (-target_pitch_rate), min=0.0, max=2.0) * in_spin
+
+    # Curriculum: start at -3.5 rad/s (gentle flip), ramp to target_pitch_rate (-7.0 rad/s full flip)
+    current_iter = env.common_step_counter // 24
+    progress = min(1.0, current_iter / float(ramp_iterations))
+    effective_target_rate = -3.5 + progress * (target_pitch_rate - (-3.5))
+
+    return torch.clamp(-pitch_rate / (-effective_target_rate), min=0.0, max=2.0) * in_spin
 
 
 def backflip_flight_height(
@@ -93,13 +107,20 @@ def backflip_flight_height(
     target_height: float = 0.70,
     min_phase: float = 0.25,
     max_phase: float = 0.80,
+    ramp_iterations: int = 3000,
 ) -> torch.Tensor:
-    """Reward torso apex flight height above the ground during mid-air flip."""
+    """Reward torso apex flight height, progressively demanding higher clearance."""
     asset = env.scene[asset_cfg.name]
     height = asset.data.root_pos_w[:, 2]
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_flight = ((phase >= min_phase) & (phase < max_phase)).float()
-    return torch.clamp(height / target_height, min=0.0, max=1.5) * in_flight
+
+    # Curriculum: start at 0.55 m (just above 0.48m standing), ramp to target_height (0.70 m apex)
+    current_iter = env.common_step_counter // 24
+    progress = min(1.0, current_iter / float(ramp_iterations))
+    effective_target_h = 0.55 + progress * (target_height - 0.55)
+
+    return torch.clamp(height / effective_target_h, min=0.0, max=1.5) * in_flight
 
 
 def landing_upright_contact(
@@ -132,31 +153,15 @@ def early_base_contact(
     return (net_force > threshold) & (phase < max_phase)
 
 
-def ramp_gravity_assistance(
+def log_curriculum_progress(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=BASE_BODY_NAME),
     ramp_iterations: int = 3000,
-    start_assist_acc: float = 4.90,
 ) -> torch.Tensor:
-    """Gradually ramp buoyant upward acceleration from 4.90 m/s^2 down to 0.0 m/s^2 (Earth gravity)."""
-    # 24 steps per iteration in PPO
+    """Track and log curriculum progression across training iterations."""
     current_iter = env.common_step_counter // 24
     progress = min(1.0, current_iter / float(ramp_iterations))
-    assist_acc = start_assist_acc * (1.0 - progress)
-
-    asset = env.scene[asset_cfg.name]
-    if assist_acc > 0.01:
-        body_id = asset_cfg.body_ids[0]
-        torso_mass = asset.data.default_mass[env_ids, body_id]
-        upward_force = torso_mass * assist_acc
-
-        forces = torch.zeros((len(env_ids), len(asset_cfg.body_ids), 3), device=env.device)
-        forces[:, 0, 2] = upward_force
-        torques = torch.zeros_like(forces)
-        asset.set_external_force_and_torque(forces, torques, body_ids=asset_cfg.body_ids, env_ids=env_ids)
-
-    return torch.tensor(assist_acc, device=env.device)
+    return torch.tensor(progress, device=env.device)
 
 
 # -----------------------------------------------------------------------------
@@ -220,10 +225,10 @@ class BackflipObservationsCfg:
 class BackflipRewardsCfg:
     """Reward terms shaping the four backflip phases (crouch, thrust, spin, land)."""
 
-    # Primary Backflip Objectives
-    takeoff = RewTerm(func=takeoff_thrust, weight=3.0, params={"target_vz": 2.0, "max_phase": 0.35})
-    pitch_spin = RewTerm(func=backflip_pitch_rate, weight=4.0, params={"target_pitch_rate": -7.0, "max_phase": 0.75})
-    flight = RewTerm(func=backflip_flight_height, weight=2.0, params={"target_height": 0.70})
+    # Primary Backflip Objectives (with progressive curriculum)
+    takeoff = RewTerm(func=takeoff_thrust, weight=3.0, params={"target_vz": 2.0, "max_phase": 0.35, "ramp_iterations": 3000})
+    pitch_spin = RewTerm(func=backflip_pitch_rate, weight=4.0, params={"target_pitch_rate": -7.0, "max_phase": 0.75, "ramp_iterations": 3000})
+    flight = RewTerm(func=backflip_flight_height, weight=2.0, params={"target_height": 0.70, "ramp_iterations": 3000})
     landing = RewTerm(
         func=landing_upright_contact,
         weight=5.0,
@@ -274,15 +279,11 @@ class BackflipTerminationsCfg:
 
 @configclass
 class BackflipCurriculumCfg:
-    """Gravity assistance curriculum transitioning smoothly from Mars to Earth."""
+    """Progressive difficulty curriculum tracking."""
 
-    gravity = CurrTerm(
-        func=ramp_gravity_assistance,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=BASE_BODY_NAME),
-            "ramp_iterations": 3000,
-            "start_assist_acc": 4.90,
-        },
+    progress = CurrTerm(
+        func=log_curriculum_progress,
+        params={"ramp_iterations": 3000},
     )
 
 
