@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 
 
@@ -38,3 +39,34 @@ def update_rsl_rl_cfg(agent_cfg, args_cli):
         agent_cfg.wandb_project = args_cli.log_project_name
         agent_cfg.neptune_project = args_cli.log_project_name
     return agent_cfg
+
+
+def resolve_task_from_registry(requested_task: str | None = None, checkpoint: str | None = None) -> str:
+    """Dynamically discover all registered BPX tasks from Gymnasium and match with checkpoint path."""
+    if requested_task:
+        return requested_task
+
+    registered_tasks: list[str] = []
+    try:
+        import gymnasium as gym
+        import mirrorme_rl_train.tasks  # noqa: F401
+
+        registered_tasks = sorted(
+            [spec.id for spec in gym.registry.values() if spec.id.startswith("bpx_")],
+            key=len,
+            reverse=True,
+        )
+    except Exception:
+        pass
+
+    if checkpoint and registered_tasks:
+        norm_ckpt = os.path.abspath(checkpoint)
+        for task in registered_tasks:
+            # Check if task is in the checkpoint directory path (e.g. logs/bpx_backflip/...)
+            if f"/{task}/" in norm_ckpt or f"_{task}_" in norm_ckpt or norm_ckpt.endswith(task):
+                return task
+            if task in norm_ckpt:
+                return task
+
+    # Default fallback
+    return "bpx_flat"

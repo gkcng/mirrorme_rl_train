@@ -143,7 +143,7 @@ def landing_upright_contact(
 def early_base_contact(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
-    threshold: float = 5.0,
+    threshold: float = 15.0,
     max_phase: float = 0.25,
 ) -> torch.Tensor:
     """Terminate only if the torso hits the floor during the initial crouch/takeoff."""
@@ -270,7 +270,7 @@ class BackflipTerminationsCfg:
         func=early_base_contact,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=BASE_BODY_NAME),
-            "threshold": 5.0,
+            "threshold": 15.0,
             "max_phase": 0.25,
         },
     )

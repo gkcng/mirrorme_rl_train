@@ -15,6 +15,7 @@ import cli_args
 
 
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--task", type=str, default=None, help="Registered Isaac Lab task ID (default: auto-detected from registry).")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
 parser.add_argument("--seed", type=int, default=None)
@@ -22,6 +23,10 @@ parser.add_argument("--output_dir", type=str, default=None)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+# Dynamically resolve task from Gymnasium registry based on checkpoint path
+args_cli.task = cli_args.resolve_task_from_registry(args_cli.task, args_cli.checkpoint)
+
 args_cli.headless = True
 default_hydra_args = ["hydra.run.dir=logs/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}"]
 sys.argv = [sys.argv[0]] + default_hydra_args + hydra_args
@@ -39,7 +44,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import mirrorme_rl_train.tasks  # noqa: F401
 
 
-def export_policy(runner: OnPolicyRunner, output_dir: str) -> None:
+def export_policy(runner: OnPolicyRunner, output_dir: str, task_name: str = "bpx_flat") -> None:
     try:
         policy_nn = runner.alg.policy
     except AttributeError:
@@ -50,11 +55,11 @@ def export_policy(runner: OnPolicyRunner, output_dir: str) -> None:
         normalizer = policy_nn.student_obs_normalizer
     else:
         normalizer = None
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=output_dir, filename="bpx_flat_45.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=output_dir, filename="bpx_flat_45.onnx")
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=output_dir, filename=f"{task_name}_45.pt")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=output_dir, filename=f"{task_name}_45.onnx")
 
 
-@hydra_task_config("bpx_flat", args_cli.agent)
+@hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -69,14 +74,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
         checkpoint = get_checkpoint_path(log_root, agent_cfg.load_run, agent_cfg.load_checkpoint)
     output_dir = args_cli.output_dir or os.path.join(os.path.dirname(checkpoint), "exported")
 
-    env = gym.make("bpx_flat", cfg=env_cfg)
+    print(f"[INFO] Exporting task: {args_cli.task}")
+    env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(checkpoint)
-    export_policy(runner, output_dir)
+    export_policy(runner, output_dir, task_name=args_cli.task)
     print(f"[PASS] checkpoint: {checkpoint}")
-    print(f"[PASS] TorchScript: {os.path.join(output_dir, 'bpx_flat_45.pt')}")
-    print(f"[PASS] ONNX:       {os.path.join(output_dir, 'bpx_flat_45.onnx')}")
+    print(f"[PASS] TorchScript: {os.path.join(output_dir, f'{args_cli.task}_45.pt')}")
+    print(f"[PASS] ONNX:       {os.path.join(output_dir, f'{args_cli.task}_45.onnx')}")
     print("[PASS] interface: obs [batch,45] -> actions [batch,12]")
     env.close()
 

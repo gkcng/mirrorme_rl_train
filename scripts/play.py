@@ -16,6 +16,7 @@ import cli_args
 
 
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--task", type=str, default=None, help="Registered Isaac Lab task ID (default: auto-detected from registry).")
 parser.add_argument("--video", action="store_true", default=False)
 parser.add_argument("--video_length", type=int, default=400)
 parser.add_argument("--num_envs", type=int, default=None)
@@ -25,6 +26,10 @@ parser.add_argument("--real_time", action="store_true", default=False)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+# Dynamically resolve task from Gymnasium registry based on checkpoint path
+args_cli.task = cli_args.resolve_task_from_registry(args_cli.task, args_cli.checkpoint)
+
 if args_cli.video:
     args_cli.enable_cameras = True
 default_hydra_args = ["hydra.run.dir=logs/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}"]
@@ -44,7 +49,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import mirrorme_rl_train.tasks  # noqa: F401
 
 
-def export_policy(runner: OnPolicyRunner, export_dir: str) -> None:
+def export_policy(runner: OnPolicyRunner, export_dir: str, task_name: str = "bpx_flat") -> None:
     try:
         policy_nn = runner.alg.policy
     except AttributeError:
@@ -55,11 +60,11 @@ def export_policy(runner: OnPolicyRunner, export_dir: str) -> None:
         normalizer = policy_nn.student_obs_normalizer
     else:
         normalizer = None
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_dir, filename="bpx_flat_45.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_dir, filename="bpx_flat_45.onnx")
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_dir, filename=f"{task_name}_45.pt")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_dir, filename=f"{task_name}_45.onnx")
 
 
-@hydra_task_config("bpx_flat", args_cli.agent)
+@hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs or 16
@@ -81,7 +86,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     log_dir = os.path.dirname(checkpoint)
     env_cfg.log_dir = log_dir
 
-    env = gym.make("bpx_flat", cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    print(f"[INFO] Playing task: {args_cli.task}")
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     if args_cli.video:
         env = gym.wrappers.RecordVideo(
             env,
@@ -96,7 +102,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     runner.load(checkpoint)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
     export_dir = os.path.join(log_dir, "exported")
-    export_policy(runner, export_dir)
+    export_policy(runner, export_dir, task_name=args_cli.task)
     print(f"[INFO] Exported to: {export_dir}")
 
     dt = env.unwrapped.step_dt
