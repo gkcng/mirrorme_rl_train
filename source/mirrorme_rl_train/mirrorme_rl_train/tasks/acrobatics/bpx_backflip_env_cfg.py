@@ -243,6 +243,61 @@ def landing_nominal_pose_l1(
     return deviation * in_settle
 
 
+def bilateral_symmetry_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Enforce bilateral (left-right) symmetry between paired limbs.
+    
+    Pairs:
+      - Front Left vs Front Right:
+          Roll:  fl_roll == -fr_roll  (roll joints mirror signs across sagittal plane)
+          Pitch: fl_pitch == fr_pitch
+          Knee:  fl_knee == fr_knee
+      - Hind Left vs Hind Right:
+          Roll:  hl_roll == -hr_roll
+          Pitch: hl_pitch == hr_pitch
+          Knee:  hl_knee == hr_knee
+          
+    Equalizing left/right joint motion prevents favoring joints, reduces unilateral
+    mechanical wear, and produces clean, balanced ballistic execution.
+    """
+    asset = env.scene[asset_cfg.name]
+    # JOINT_NAMES order:
+    # 0: fl_roll, 1: fr_roll, 2: hl_roll, 3: hr_roll
+    # 4: fl_pitch, 5: fr_pitch, 6: hl_pitch, 7: hr_pitch
+    # 8: fl_knee, 9: fr_knee, 10: hl_knee, 11: hr_knee
+    q = asset.data.joint_pos
+
+    # Roll symmetry: q_left + q_right should be 0 (equal magnitude, opposite sign)
+    roll_asym = (q[:, 0] + q[:, 1]).square() + (q[:, 2] + q[:, 3]).square()
+    # Pitch symmetry: q_left - q_right should be 0 (identical angles)
+    pitch_asym = (q[:, 4] - q[:, 5]).square() + (q[:, 6] - q[:, 7]).square()
+    # Knee symmetry: q_left - q_right should be 0 (identical angles)
+    knee_asym = (q[:, 8] - q[:, 9]).square() + (q[:, 10] - q[:, 11]).square()
+
+    return roll_asym + pitch_asym + knee_asym
+
+
+def bilateral_torque_symmetry_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize asymmetric torque effort between left and right motor pairs.
+    
+    Prevents one side's actuators from delivering disproportionate torque
+    and overheating or suffering accelerated gear wear.
+    """
+    asset = env.scene[asset_cfg.name]
+    tau = asset.data.applied_torque
+
+    roll_tau_asym = (tau[:, 0] + tau[:, 1]).square() + (tau[:, 2] + tau[:, 3]).square()
+    pitch_tau_asym = (tau[:, 4] - tau[:, 5]).square() + (tau[:, 6] - tau[:, 7]).square()
+    knee_tau_asym = (tau[:, 8] - tau[:, 9]).square() + (tau[:, 10] - tau[:, 11]).square()
+
+    return roll_tau_asym + pitch_tau_asym + knee_tau_asym
+
+
 # -----------------------------------------------------------------------------
 # Anti-Stalling & Inversion Guarantees (Addressing failure to flip)
 # -----------------------------------------------------------------------------
@@ -425,9 +480,11 @@ class BackflipRewardsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=list(FOOT_BODY_NAMES), preserve_order=True)},
     )
 
-    # 2. Heading Discipline (Fix a: eliminate corkscrew twist & land facing forward)
+    # 2. Heading Discipline & Bilateral Symmetry (Fix a: eliminate corkscrew twist & limb favoritism)
     flight_twist_penalty = RewTerm(func=flight_twist_penalty, weight=-0.05)
     landing_heading = RewTerm(func=landing_heading_alignment, weight=2.0, params={"std": 0.35})
+    bilateral_symmetry = RewTerm(func=bilateral_symmetry_penalty, weight=-0.1)
+    bilateral_torque_symmetry = RewTerm(func=bilateral_torque_symmetry_penalty, weight=-1.0e-5)
 
     # 3. Spot Landing (Fix b: eliminate horizontal drift away from start)
     landing_spot_drift = RewTerm(func=landing_spot_drift_l2, weight=-2.0)
