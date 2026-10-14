@@ -323,10 +323,20 @@ def ramp_gravity_assistance(
     asset = env.scene[asset_cfg.name]
     if assist_acc > 0.01:
         body_id = asset_cfg.body_ids[0]
-        torso_mass = asset.data.default_mass[env_ids, body_id]
+        # Ensure env_ids tensor matches the device of asset.data.default_mass
+        mass_device = asset.data.default_mass.device
+        if isinstance(env_ids, torch.Tensor):
+            ids = env_ids.to(mass_device)
+        elif env_ids is None or (isinstance(env_ids, slice) and env_ids == slice(None)):
+            ids = slice(None)
+        else:
+            ids = torch.tensor(env_ids, dtype=torch.long, device=mass_device)
+
+        torso_mass = asset.data.default_mass[ids, body_id].to(env.device)
         upward_force = torso_mass * assist_acc
 
-        forces = torch.zeros((len(env_ids), len(asset_cfg.body_ids), 3), device=env.device)
+        num_target_envs = len(env_ids) if hasattr(env_ids, "__len__") else env.num_envs
+        forces = torch.zeros((num_target_envs, len(asset_cfg.body_ids), 3), device=env.device)
         forces[:, 0, 2] = upward_force
         torques = torch.zeros_like(forces)
         asset.set_external_force_and_torque(forces, torques, body_ids=asset_cfg.body_ids, env_ids=env_ids)
