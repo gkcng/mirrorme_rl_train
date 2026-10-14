@@ -66,7 +66,7 @@ def takeoff_thrust(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_vz: float = 2.0,
     max_phase: float = 0.35,
-    ramp_iterations: int = 3000,
+    ramp_transitions: int = 150_000_000,
 ) -> torch.Tensor:
     """Reward positive vertical launch velocity, progressively increasing target vz."""
     asset = env.scene[asset_cfg.name]
@@ -74,8 +74,8 @@ def takeoff_thrust(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_takeoff = (phase < max_phase).float()
 
-    current_iter = env.common_step_counter // 24
-    progress = min(1.0, current_iter / float(ramp_iterations))
+    total_transitions = env.common_step_counter * env.num_envs
+    progress = min(1.0, total_transitions / float(ramp_transitions))
     effective_target_vz = 1.0 + progress * (target_vz - 1.0)
 
     return torch.clamp(vz / effective_target_vz, min=0.0, max=1.5) * in_takeoff
@@ -86,7 +86,7 @@ def backflip_pitch_rate(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_pitch_rate: float = -7.0,
     max_phase: float = 0.75,
-    ramp_iterations: int = 3000,
+    ramp_transitions: int = 150_000_000,
 ) -> torch.Tensor:
     """Reward backward pitch rotation rate, progressively demanding faster rotation."""
     asset = env.scene[asset_cfg.name]
@@ -94,8 +94,8 @@ def backflip_pitch_rate(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_spin = (phase < max_phase).float()
 
-    current_iter = env.common_step_counter // 24
-    progress = min(1.0, current_iter / float(ramp_iterations))
+    total_transitions = env.common_step_counter * env.num_envs
+    progress = min(1.0, total_transitions / float(ramp_transitions))
     effective_target_rate = -3.5 + progress * (target_pitch_rate - (-3.5))
 
     return torch.clamp(-pitch_rate / (-effective_target_rate), min=0.0, max=2.0) * in_spin
@@ -107,7 +107,7 @@ def backflip_flight_height(
     target_height: float = 0.70,
     min_phase: float = 0.25,
     max_phase: float = 0.80,
-    ramp_iterations: int = 3000,
+    ramp_transitions: int = 150_000_000,
 ) -> torch.Tensor:
     """Reward torso apex flight height, progressively demanding higher clearance."""
     asset = env.scene[asset_cfg.name]
@@ -115,8 +115,8 @@ def backflip_flight_height(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_flight = ((phase >= min_phase) & (phase < max_phase)).float()
 
-    current_iter = env.common_step_counter // 24
-    progress = min(1.0, current_iter / float(ramp_iterations))
+    total_transitions = env.common_step_counter * env.num_envs
+    progress = min(1.0, total_transitions / float(ramp_transitions))
     effective_target_h = 0.55 + progress * (target_height - 0.55)
 
     return torch.clamp(height / effective_target_h, min=0.0, max=1.5) * in_flight
@@ -166,14 +166,23 @@ def landing_heading_alignment(
     min_phase: float = 0.80,
     std: float = 0.35,
 ) -> torch.Tensor:
-    """(a) Reward landing facing the exact same forward direction as starting heading."""
+    """(a) Reward landing facing the exact same direction as the initial reset heading."""
     asset = env.scene[asset_cfg.name]
     quat = asset.data.root_quat_w
     w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    yaw = torch.atan2(siny_cosp, cosy_cosp)
-    yaw_error_sq = yaw.square()
+    current_yaw = torch.atan2(siny_cosp, cosy_cosp)
+    
+    # Track initial yaw at reset
+    if not hasattr(env, "_initial_yaw") or env._initial_yaw.shape[0] != env.num_envs:
+        env._initial_yaw = current_yaw.clone()
+    reset_ids = (env.episode_length_buf <= 1).nonzero(as_tuple=False).flatten()
+    if len(reset_ids) > 0:
+        env._initial_yaw[reset_ids] = current_yaw[reset_ids]
+
+    yaw_diff = torch.atan2(torch.sin(current_yaw - env._initial_yaw), torch.cos(current_yaw - env._initial_yaw))
+    yaw_error_sq = yaw_diff.square()
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_landing = (phase >= min_phase).float()
     return torch.exp(-yaw_error_sq / (std ** 2)) * in_landing
@@ -234,6 +243,40 @@ def landing_nominal_pose_l1(
     return deviation * in_settle
 
 
+# -----------------------------------------------------------------------------
+# Anti-Stalling & Inversion Guarantees (Addressing failure to flip)
+# -----------------------------------------------------------------------------
+
+def flight_feet_contact_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    min_phase: float = 0.35,
+    max_phase: float = 0.70,
+) -> torch.Tensor:
+    """Penalize grounded feet during peak flight phase (punishes refusal to jump / crouching)."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    feet_in_contact = (contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2] > 1.0).float().sum(dim=1)
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_flight = ((phase >= min_phase) & (phase < max_phase)).float()
+    return feet_in_contact * in_flight
+
+
+def failure_to_invert_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    check_min_phase: float = 0.45,
+    check_max_phase: float = 0.65,
+) -> torch.Tensor:
+    """Heavily penalize the robot if it has not inverted (upside down) by mid-flight."""
+    asset = env.scene[asset_cfg.name]
+    proj_grav_z = asset.data.projected_gravity_b[:, 2]
+    # For a standing robot, projected gravity z is ~ -1.0. When upside down, z is > 0.0.
+    not_inverted = (proj_grav_z < 0.0).float()
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_check_window = ((phase >= check_min_phase) & (phase < check_max_phase)).float()
+    return not_inverted * in_check_window
+
+
 def early_base_contact(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
@@ -247,14 +290,58 @@ def early_base_contact(
     return (net_force > threshold) & (phase < max_phase)
 
 
+def mid_flight_inversion_failure(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    check_phase: float = 0.55,
+) -> torch.Tensor:
+    """Terminate episode if the robot completely failed to initiate backward pitch by mid-flight."""
+    asset = env.scene[asset_cfg.name]
+    # Pitch rate should be negative (pitching backward). If it's near zero or positive, terminate.
+    proj_grav_z = asset.data.projected_gravity_b[:, 2]
+    # At phase ~0.55, robot must be inverted (proj_grav_z > -0.2)
+    step = env.episode_length_buf
+    check_step = int(check_phase * env.max_episode_length)
+    # Check at the exact trigger step
+    is_check_step = (step == check_step)
+    failed_to_flip = is_check_step & (proj_grav_z < -0.2)
+    return failed_to_flip
+
+
+def ramp_gravity_assistance(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=BASE_BODY_NAME),
+    ramp_transitions: int = 150_000_000,
+    start_assist_acc: float = 4.90,
+) -> torch.Tensor:
+    """Gradually ramp buoyant upward acceleration from 4.90 m/s^2 down to 0.0 m/s^2 (Earth gravity)."""
+    total_transitions = env.common_step_counter * env.num_envs
+    progress = min(1.0, total_transitions / float(ramp_transitions))
+    assist_acc = start_assist_acc * (1.0 - progress)
+
+    asset = env.scene[asset_cfg.name]
+    if assist_acc > 0.01:
+        body_id = asset_cfg.body_ids[0]
+        torso_mass = asset.data.default_mass[env_ids, body_id]
+        upward_force = torso_mass * assist_acc
+
+        forces = torch.zeros((len(env_ids), len(asset_cfg.body_ids), 3), device=env.device)
+        forces[:, 0, 2] = upward_force
+        torques = torch.zeros_like(forces)
+        asset.set_external_force_and_torque(forces, torques, body_ids=asset_cfg.body_ids, env_ids=env_ids)
+
+    return torch.tensor(assist_acc, device=env.device)
+
+
 def log_curriculum_progress(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
-    ramp_iterations: int = 3000,
+    ramp_transitions: int = 150_000_000,
 ) -> torch.Tensor:
     """Track and log curriculum progression across training iterations."""
-    current_iter = env.common_step_counter // 24
-    progress = min(1.0, current_iter / float(ramp_iterations))
+    total_transitions = env.common_step_counter * env.num_envs
+    progress = min(1.0, total_transitions / float(ramp_transitions))
     return torch.tensor(progress, device=env.device)
 
 
@@ -319,9 +406,9 @@ class BackflipRewardsCfg:
     """Reward suite shaping backflip dynamics, flight discipline, and stable landing."""
 
     # 1. Primary Backflip Flight Objectives (Curriculum)
-    takeoff = RewTerm(func=takeoff_thrust, weight=3.0, params={"target_vz": 2.0, "max_phase": 0.35, "ramp_iterations": 3000})
-    pitch_spin = RewTerm(func=backflip_pitch_rate, weight=4.0, params={"target_pitch_rate": -7.0, "max_phase": 0.75, "ramp_iterations": 3000})
-    flight = RewTerm(func=backflip_flight_height, weight=2.0, params={"target_height": 0.70, "ramp_iterations": 3000})
+    takeoff = RewTerm(func=takeoff_thrust, weight=3.0, params={"target_vz": 2.0, "max_phase": 0.35, "ramp_transitions": 150_000_000})
+    pitch_spin = RewTerm(func=backflip_pitch_rate, weight=4.0, params={"target_pitch_rate": -7.0, "max_phase": 0.75, "ramp_transitions": 150_000_000})
+    flight = RewTerm(func=backflip_flight_height, weight=2.0, params={"target_height": 0.70, "ramp_transitions": 150_000_000})
     landing = RewTerm(
         func=landing_upright_contact,
         weight=5.0,
@@ -340,7 +427,15 @@ class BackflipRewardsCfg:
     landing_joint_vel = RewTerm(func=landing_joint_vel_l2, weight=-0.01)
     landing_nominal_pose = RewTerm(func=landing_nominal_pose_l1, weight=-0.2)
 
-    # 5. Smoothness & Safety Regularization
+    # 5. Anti-Stalling & Inversion Guarantees (Prevents cowardly standing/crouching)
+    flight_grounded_feet = RewTerm(
+        func=flight_feet_contact_penalty,
+        weight=-2.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=list(FOOT_BODY_NAMES), preserve_order=True)},
+    )
+    failure_to_invert = RewTerm(func=failure_to_invert_penalty, weight=-6.0)
+
+    # 6. Smoothness & Safety Regularization
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(
         func=mdp.joint_torques_l2,
@@ -379,15 +474,27 @@ class BackflipTerminationsCfg:
             "max_phase": 0.25,
         },
     )
+    mid_flight_fail = DoneTerm(
+        func=mid_flight_inversion_failure,
+        params={"check_phase": 0.55},
+    )
 
 
 @configclass
 class BackflipCurriculumCfg:
-    """Progressive difficulty curriculum tracking."""
+    """Progressive difficulty and gravity assistance curriculum."""
 
+    gravity = CurrTerm(
+        func=ramp_gravity_assistance,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=BASE_BODY_NAME),
+            "ramp_transitions": 150_000_000,
+            "start_assist_acc": 4.90,
+        },
+    )
     progress = CurrTerm(
         func=log_curriculum_progress,
-        params={"ramp_iterations": 3000},
+        params={"ramp_transitions": 150_000_000},
     )
 
 
@@ -435,7 +542,7 @@ class BackflipEventCfg:
             "pose_range": {
                 "x": (-0.15, 0.15),
                 "y": (-0.15, 0.15),
-                "yaw": (-0.25, 0.25),  # Random initial heading to force directional awareness
+                "yaw": (-math.pi, math.pi),  # Full 360° omnidirectional heading at reset
             },
             "velocity_range": {
                 "x": (-0.20, 0.20),
