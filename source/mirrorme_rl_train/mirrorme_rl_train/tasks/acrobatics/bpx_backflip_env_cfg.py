@@ -12,6 +12,7 @@ Training interface
 * Action: 12 joint-position residuals.
 * Critic: actor observations plus privileged base linear velocity (48 dimensions).
 * Curriculum: Progressive difficulty ramp scaling launch thrust, apex height, and pitch rate.
+* Discipline: Zero-twist single-axis rotation, spot-landing proximity, and firm touchdown stabilization.
 """
 
 from __future__ import annotations
@@ -22,12 +23,14 @@ from typing import TYPE_CHECKING, Sequence
 import torch
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensor
+import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab_tasks.manager_based.locomotion.velocity import mdp
@@ -38,7 +41,6 @@ from ..locomotion.bpx_flat_env_cfg import (
     JOINT_NAMES,
     ActionsCfg,
     BPXSceneCfg,
-    EventCfg,
 )
 
 if TYPE_CHECKING:
@@ -72,7 +74,6 @@ def takeoff_thrust(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_takeoff = (phase < max_phase).float()
 
-    # Curriculum: start at 1.0 m/s (easy hop), ramp to target_vz (2.0 m/s full explosive launch)
     current_iter = env.common_step_counter // 24
     progress = min(1.0, current_iter / float(ramp_iterations))
     effective_target_vz = 1.0 + progress * (target_vz - 1.0)
@@ -93,7 +94,6 @@ def backflip_pitch_rate(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_spin = (phase < max_phase).float()
 
-    # Curriculum: start at -3.5 rad/s (gentle flip), ramp to target_pitch_rate (-7.0 rad/s full flip)
     current_iter = env.common_step_counter // 24
     progress = min(1.0, current_iter / float(ramp_iterations))
     effective_target_rate = -3.5 + progress * (target_pitch_rate - (-3.5))
@@ -115,7 +115,6 @@ def backflip_flight_height(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_flight = ((phase >= min_phase) & (phase < max_phase)).float()
 
-    # Curriculum: start at 0.55 m (just above 0.48m standing), ramp to target_height (0.70 m apex)
     current_iter = env.common_step_counter // 24
     progress = min(1.0, current_iter / float(ramp_iterations))
     effective_target_h = 0.55 + progress * (target_height - 0.55)
@@ -138,6 +137,101 @@ def landing_upright_contact(
     phase = env.episode_length_buf.float() / float(env.max_episode_length)
     in_landing = (phase >= min_phase).float()
     return upright * feet_contact * in_landing
+
+
+# -----------------------------------------------------------------------------
+# Precision & Stabilization Rewards (Addressing a, b, c)
+# -----------------------------------------------------------------------------
+
+def flight_twist_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_phase: float = 0.15,
+    max_phase: float = 0.85,
+) -> torch.Tensor:
+    """(a) Penalize parasitic roll (ang_vel_x) and yaw (ang_vel_z) spinning during flight."""
+    asset = env.scene[asset_cfg.name]
+    ang_vel_b = asset.data.root_ang_vel_b
+    roll_rate = ang_vel_b[:, 0]
+    yaw_rate = ang_vel_b[:, 2]
+    twist_sq = roll_rate.square() + yaw_rate.square()
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_flight = ((phase >= min_phase) & (phase < max_phase)).float()
+    return twist_sq * in_flight
+
+
+def landing_heading_alignment(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_phase: float = 0.80,
+    std: float = 0.35,
+) -> torch.Tensor:
+    """(a) Reward landing facing the exact same forward direction as starting heading."""
+    asset = env.scene[asset_cfg.name]
+    quat = asset.data.root_quat_w
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny_cosp, cosy_cosp)
+    yaw_error_sq = yaw.square()
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_landing = (phase >= min_phase).float()
+    return torch.exp(-yaw_error_sq / (std ** 2)) * in_landing
+
+
+def landing_spot_drift_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_phase: float = 0.80,
+) -> torch.Tensor:
+    """(b) Penalize horizontal (X, Y) landing displacement away from the origin."""
+    asset = env.scene[asset_cfg.name]
+    drift_xy = asset.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    drift_sq = torch.sum(drift_xy.square(), dim=1)
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_landing = (phase >= min_phase).float()
+    return drift_sq * in_landing
+
+
+def landing_base_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_phase: float = 0.85,
+) -> torch.Tensor:
+    """(c) Penalize residual base linear velocity upon touchdown (eliminating landing bounce)."""
+    asset = env.scene[asset_cfg.name]
+    lin_vel_sq = torch.sum(asset.data.root_lin_vel_w.square(), dim=1)
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_settle = (phase >= min_phase).float()
+    return lin_vel_sq * in_settle
+
+
+def landing_joint_vel_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_phase: float = 0.85,
+) -> torch.Tensor:
+    """(c) Penalize residual joint velocities upon touchdown (eliminating leg scrambling)."""
+    asset = env.scene[asset_cfg.name]
+    joint_vel_sq = torch.sum(asset.data.joint_vel[:, asset_cfg.joint_ids].square(), dim=1)
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_settle = (phase >= min_phase).float()
+    return joint_vel_sq * in_settle
+
+
+def landing_nominal_pose_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_phase: float = 0.85,
+) -> torch.Tensor:
+    """(c) Reward returning joints to nominal standing pose during touchdown."""
+    asset = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    default_pos = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    deviation = torch.sum(torch.abs(joint_pos - default_pos), dim=1)
+    phase = env.episode_length_buf.float() / float(env.max_episode_length)
+    in_settle = (phase >= min_phase).float()
+    return deviation * in_settle
 
 
 def early_base_contact(
@@ -185,7 +279,6 @@ class BackflipObservationsCfg:
             clip=(-100.0, 100.0),
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
-        # Phase clock preserves the 3-D command interface of bpx_flat (3D)
         flip_clock = ObsTerm(
             func=flip_phase_clock,
             clip=(-10.0, 10.0),
@@ -223,9 +316,9 @@ class BackflipObservationsCfg:
 
 @configclass
 class BackflipRewardsCfg:
-    """Reward terms shaping the four backflip phases (crouch, thrust, spin, land)."""
+    """Reward suite shaping backflip dynamics, flight discipline, and stable landing."""
 
-    # Primary Backflip Objectives (with progressive curriculum)
+    # 1. Primary Backflip Flight Objectives (Curriculum)
     takeoff = RewTerm(func=takeoff_thrust, weight=3.0, params={"target_vz": 2.0, "max_phase": 0.35, "ramp_iterations": 3000})
     pitch_spin = RewTerm(func=backflip_pitch_rate, weight=4.0, params={"target_pitch_rate": -7.0, "max_phase": 0.75, "ramp_iterations": 3000})
     flight = RewTerm(func=backflip_flight_height, weight=2.0, params={"target_height": 0.70, "ramp_iterations": 3000})
@@ -235,7 +328,19 @@ class BackflipRewardsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=list(FOOT_BODY_NAMES), preserve_order=True)},
     )
 
-    # Smoothness & Safety Regularization
+    # 2. Heading Discipline (Fix a: eliminate corkscrew twist & land facing forward)
+    flight_twist_penalty = RewTerm(func=flight_twist_penalty, weight=-0.05)
+    landing_heading = RewTerm(func=landing_heading_alignment, weight=2.0, params={"std": 0.35})
+
+    # 3. Spot Landing (Fix b: eliminate horizontal drift away from start)
+    landing_spot_drift = RewTerm(func=landing_spot_drift_l2, weight=-2.0)
+
+    # 4. Stick the Landing (Fix c: eliminate bounce, leg scrambling, and settle into stance)
+    landing_base_vel = RewTerm(func=landing_base_velocity_l2, weight=-0.5)
+    landing_joint_vel = RewTerm(func=landing_joint_vel_l2, weight=-0.01)
+    landing_nominal_pose = RewTerm(func=landing_nominal_pose_l1, weight=-0.2)
+
+    # 5. Smoothness & Safety Regularization
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(
         func=mdp.joint_torques_l2,
@@ -274,7 +379,6 @@ class BackflipTerminationsCfg:
             "max_phase": 0.25,
         },
     )
-    # Notice: bad_orientation termination is intentionally absent to allow full 360-degree flip!
 
 
 @configclass
@@ -288,6 +392,74 @@ class BackflipCurriculumCfg:
 
 
 @configclass
+class BackflipEventCfg:
+    """(Fix d) Dynamic domain randomization and per-episode perturbations."""
+
+    # Physics material randomization at startup
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.40, 1.60),
+            "dynamic_friction_range": (0.30, 1.35),
+            "restitution_range": (0.0, 0.15),
+            "num_buckets": 128,
+        },
+    )
+
+    # Payload & Center-of-Mass randomization at startup
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=BASE_BODY_NAME),
+            "mass_distribution_params": (-1.5, 2.5),
+            "operation": "add",
+        },
+    )
+    base_com = EventTerm(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=BASE_BODY_NAME),
+            "com_range": {"x": (-0.035, 0.035), "y": (-0.035, 0.035), "z": (-0.035, 0.035)},
+        },
+    )
+
+    # Every Episode Reset: randomize initial pose, heading, and root velocities
+    reset_base = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (-0.15, 0.15),
+                "y": (-0.15, 0.15),
+                "yaw": (-0.25, 0.25),  # Random initial heading to force directional awareness
+            },
+            "velocity_range": {
+                "x": (-0.20, 0.20),
+                "y": (-0.20, 0.20),
+                "z": (-0.05, 0.05),
+                "roll": (-0.15, 0.15),
+                "pitch": (-0.15, 0.15),
+                "yaw": (-0.20, 0.20),
+            },
+        },
+    )
+
+    # Every Episode Reset: randomize joint angles and velocities
+    reset_robot_joints = EventTerm(
+        func=mdp.reset_joints_by_scale,
+        mode="reset",
+        params={
+            "position_range": (0.92, 1.08),
+            "velocity_range": (-0.25, 0.25),
+        },
+    )
+
+
+@configclass
 class BPXBackflipEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the BPX backflip task."""
 
@@ -296,7 +468,7 @@ class BPXBackflipEnvCfg(ManagerBasedRLEnvCfg):
     actions: ActionsCfg = ActionsCfg()
     rewards: BackflipRewardsCfg = BackflipRewardsCfg()
     terminations: BackflipTerminationsCfg = BackflipTerminationsCfg()
-    events: EventCfg = EventCfg()
+    events: BackflipEventCfg = BackflipEventCfg()
     curriculum: BackflipCurriculumCfg = BackflipCurriculumCfg()
 
     def __post_init__(self):
